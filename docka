@@ -1,0 +1,118 @@
+#!/usr/bin/env ruby
+
+require 'fileutils'
+require 'yaml'
+
+SHEB = "#!/usr/bin/env bash"
+INIT = "docker-machine start docka;"\
+       "eval \"$(docker-machine env docka)\""
+SHIMS = "#{Dir.home}/.docka/shims"
+HOMES = "#{Dir.home}/.docka/homes"
+REPOS = Dir.glob("#{Dir.home}/.docka/repos/*")
+
+FileUtils.mkdir_p SHIMS
+FileUtils.mkdir_p HOMES
+
+ARGV << 'help' if ARGV.empty?
+command = ARGV.shift
+
+def build(dir,pkg)
+	ctx = File.join(dir,'img')
+	system("#{INIT} && "\
+	       "docker build -t docka/#{pkg} #{ctx}")
+end
+
+def exports(dir)
+	YAML.load(IO.read(File.join(dir,"docka.yml")))["export"] || []	
+end
+
+def imports(dir)
+    YAML.load(IO.read(File.join(dir,"docka.yml")))["import"] || []
+end
+
+def p_volume(host,vm)
+	"-v #{host}:#{vm}"	
+end
+
+def p_volumes(export)
+	[ p_volume("#{Dir.home}/.docka",'/root/.docka'),
+         p_volume("$(pwd)",'/shared'),
+	  "-w='/shared'" ].join(" ")
+end
+
+def p_copy_env(e)
+    "-e \"#{e}=#{ENV[e]}\""
+end
+
+def p_envs()
+    [ p_copy_env("DOCKER_HOST"),
+      p_copy_env("DOCKER_MACHINE_NAME"),
+      p_copy_env("DOCKER_TLS_VERIFY")].join(" ")
+end
+
+def shim(pkg,export)
+	
+    opts = case export
+        when String
+            {export.to_s => {"settings" => nil, "exec" => nil}}
+        else
+            export
+        end
+    c = opts.keys[0].to_s
+    if c == "" then
+        return nil
+    end
+    s = opts[c]["settings"] || ""
+    e = opts[c]["exec"] || "#{c} $@"
+    cmd = File.join(SHIMS,c)
+	home = File.join(HOMES,c)
+	FileUtils.mkdir_p home
+	IO.write(cmd,"#{SHEB}\n#{INIT} && "\
+		     "docker run --rm -it #{p_volumes(c)} #{p_envs()} #{s} docka/#{pkg} bash -c '~/init.sh && #{e}'")
+	FileUtils.chmod("+x",cmd)
+end
+
+actions = {
+	"install" => (install = lambda { |argv|  
+		pkg = argv.shift
+		dir = Dir.glob(File.join(REPOS,pkg)).first
+		if dir.nil? 
+            raise "Couldn't find #{pkg}"
+        end
+        build(dir,pkg)
+		exports(dir).map {|e| 
+            shim(pkg,e) 
+        }
+        imports(dir).map {|i|
+            puts i
+            install.call([i])    
+        }
+	}),
+	"uninstall" => lambda { |argv| 
+        pkg = argv.shift 
+		dir = Dir.glob(File.join(REPOS,pkg)).first
+        if dir.nil? 
+            raise "Couldn't find #{pkg}"
+        end  
+        exports(dir).map {|e|
+            c = case e
+                when Hash
+                    e.keys[0]
+                else 
+                    e
+                end
+            FileUtils.rm_rf File.join(SHIMS,c)
+            FileUtils.rm_rf File.join(HOMES,c)
+        }
+	},
+    "update" => lambda { |argv|
+        REPOS.each{ |r|
+            system "cd #{r}; git pull origin master"
+        }    
+    },
+	"help" 	=> lambda { |argv| 
+		puts "help #{argv}" 
+	}
+}
+
+actions[command].call(ARGV)
